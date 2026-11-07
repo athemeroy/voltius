@@ -1,22 +1,19 @@
-use crate::error::AppError;
-use crate::knock::KnockSpec;
-use crate::known_hosts::{KnownHostsStore, PendingConflicts};
-use crate::port_forward::PortForwardManager;
-use crate::proxy::ProxySpec;
-use crate::ssh::{
-    client::{self, HopRoute, JumpHostConnect},
-    session::SessionManager,
-};
 use std::sync::Arc;
 use tauri::AppHandle;
+
+#[cfg(target_os = "android")]
+const DEFAULT_KEEPALIVE_INTERVAL_SECS: u64 = 10;
+#[cfg(not(target_os = "android"))]
+const DEFAULT_KEEPALIVE_INTERVAL_SECS: u64 = 3;
+
+#[cfg(target_os = "android")]
+const DEFAULT_KEEPALIVE_MAX: usize = 6;
+#[cfg(not(target_os = "android"))]
+const DEFAULT_KEEPALIVE_MAX: usize = 3;
 
 #[tauri::command]
 pub async fn ssh_connect(
     app: AppHandle,
-    state: tauri::State<'_, SessionManager>,
-    pf: tauri::State<'_, PortForwardManager>,
-    known_hosts: tauri::State<'_, Arc<KnownHostsStore>>,
-    pending_conflicts: tauri::State<'_, Arc<PendingConflicts>>,
     session_id: String,
     host: String,
     port: u16,
@@ -24,28 +21,28 @@ pub async fn ssh_connect(
     password: Option<String>,
     private_key: Option<String>,
     passphrase: Option<String>,
-    connection_id: Option<String>,
-    jump_hosts: Option<Vec<JumpHostConnect>>,
+    jump_hosts: Option<Vec<crate::ssh::JumpHost>>,
     env_vars: Option<Vec<(String, String)>>,
     agent_forwarding: bool,
     pre_command: Option<String>,
-    auto_forward: bool,
     shell_integration: Option<bool>,
+    known_hosts: tauri::State<'_, crate::ssh::KnownHosts>,
+    pending_conflicts: tauri::State<'_, crate::ssh::PendingConflicts>,
     keepalive_interval_secs: Option<u64>,
     keepalive_max: Option<usize>,
     persist: Option<bool>,
     restore: Option<bool>,
     attach_only: Option<bool>,
-    cols: Option<u32>,
-    rows: Option<u32>,
+    cols: Option<u16>,
+    rows: Option<u16>,
     legacy_algorithms: Option<bool>,
     initial_cwd: Option<String>,
-    proxy: Option<ProxySpec>,
-    terminal_colors: Option<crate::ssh::control_mode::TerminalColors>,
-    knock: Option<KnockSpec>,
+    proxy: Option<crate::ssh::Proxy>,
+    knock: Option<crate::ssh::Knock>,
+    terminal_colors: Option<crate::ssh::TerminalColors>,
     detached_ttl_secs: Option<u64>,
-) -> Result<(), AppError> {
-    let connected = client::connect(
+) -> Result<(), String> {
+    let connected = crate::ssh::ssh_connect(
         app,
         session_id.clone(),
         &host,
@@ -61,8 +58,8 @@ pub async fn ssh_connect(
         shell_integration.unwrap_or(true),
         Arc::clone(&*known_hosts),
         Arc::clone(&*pending_conflicts),
-        keepalive_interval_secs.unwrap_or(3),
-        keepalive_max.unwrap_or(3),
+        keepalive_interval_secs.unwrap_or(DEFAULT_KEEPALIVE_INTERVAL_SECS),
+        keepalive_max.unwrap_or(DEFAULT_KEEPALIVE_MAX),
         persist.unwrap_or(true),
         restore.unwrap_or(false),
         attach_only.unwrap_or(false),
@@ -70,281 +67,12 @@ pub async fn ssh_connect(
         rows.filter(|r| *r > 0).unwrap_or(24),
         legacy_algorithms.unwrap_or(false),
         initial_cwd,
-        HopRoute { proxy, knock },
+        crate::ssh::HopRoute { proxy, knock },
         terminal_colors,
         detached_ttl_secs,
     )
     .await?;
 
-    state.add(session_id.clone(), connected).await;
-
-    // Register this terminal under its host key so port forwarding is shared
-    // across all terminals of the same connection (not duplicated per terminal).
-    let cid = connection_id.as_deref().unwrap_or("");
-    pf.register_session(&session_id, cid).await;
-
-    if let Ok(handle) = state.get_session_handle(&session_id).await {
-        let routes = state
-            .get_remote_routes(&session_id)
-            .await
-            .unwrap_or_else(|_| {
-                Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
-            });
-        // No-op for a first connect (nothing to re-arm) and for a reconnect with
-        // only local/dynamic tunnels, which follow the new handle by themselves.
-        pf.rearm_after_reconnect(&session_id, Arc::clone(&handle), Arc::clone(&routes))
-            .await;
-        pf.auto_activate_rules(&session_id, cid, Arc::clone(&handle), routes)
-            .await;
-        let _ = pf.set_auto_detect(&session_id, auto_forward, handle).await;
-    }
-
+    crate::ssh::STATE.add(session_id.clone(), connected).await;
     Ok(())
-}
-
-#[tauri::command]
-pub async fn ssh_disconnect(
-    state: tauri::State<'_, SessionManager>,
-    pf: tauri::State<'_, PortForwardManager>,
-    session_id: String,
-    post_command: Option<String>,
-    kill_persistent: Option<bool>,
-    attached: Option<bool>,
-    reconnecting: Option<bool>,
-) -> Result<bool, String> {
-    // A reconnect drops the SSH connection and immediately dials again under the
-    // same session id, so the terminal is not leaving its host — the forwards
-    // stay up and `ssh_connect` re-arms them. Tearing them down here is what used
-    // to lose every ad-hoc tunnel across a reconnect, since only rule-backed ones
-    // were rebuilt afterwards.
-    if !reconnecting.unwrap_or(false) {
-        // Host-scoped port forwarding: only tear down when the last terminal of the
-        // host closes. If the terminal that owned the forwards leaves while siblings
-        // remain, hand the forwards off to a surviving terminal's SSH handle so they
-        // keep working.
-        let (key, remaining, was_owner) = pf.detach_session(&session_id).await;
-        if remaining.is_empty() {
-            pf.teardown_key(&key).await;
-        } else {
-            if was_owner {
-                if let Some(survivor) = remaining.first() {
-                    if let Ok(handle) = state.get_session_handle(survivor).await {
-                        let routes = state.get_remote_routes(survivor).await.unwrap_or_else(|_| {
-                            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
-                        });
-                        pf.rebind_to_handle(&key, survivor, handle, routes).await;
-                    }
-                }
-            }
-            pf.clear_session_panel(&session_id).await;
-        }
-    }
-
-    state
-        .disconnect(
-            &session_id,
-            post_command,
-            kill_persistent.unwrap_or(false),
-            attached.unwrap_or(false),
-        )
-        .await
-}
-
-#[tauri::command]
-pub async fn ssh_send_input(
-    state: tauri::State<'_, SessionManager>,
-    session_id: String,
-    data: Vec<u8>,
-) -> Result<(), String> {
-    state.send_data(&session_id, &data).await
-}
-
-#[tauri::command]
-pub async fn ssh_detect_distro(
-    state: tauri::State<'_, SessionManager>,
-    session_id: String,
-) -> Result<String, String> {
-    state.detect_distro(&session_id).await
-}
-
-#[tauri::command]
-pub async fn ssh_get_system_info(
-    state: tauri::State<'_, SessionManager>,
-    session_id: String,
-) -> Result<crate::ssh::session::SystemInfo, String> {
-    state.get_system_info(&session_id).await
-}
-
-#[tauri::command]
-pub async fn ssh_resize(
-    state: tauri::State<'_, SessionManager>,
-    session_id: String,
-    cols: u32,
-    rows: u32,
-) -> Result<(), String> {
-    state.resize(&session_id, cols, rows).await
-}
-
-#[tauri::command]
-pub async fn ssh_set_output_paused(
-    state: tauri::State<'_, SessionManager>,
-    session_id: String,
-    paused: bool,
-) -> Result<(), String> {
-    state.set_output_paused(&session_id, paused).await
-}
-
-#[tauri::command]
-pub async fn ssh_set_terminal_colors(
-    state: tauri::State<'_, SessionManager>,
-    session_id: String,
-    colors: crate::ssh::control_mode::TerminalColors,
-) -> Result<(), String> {
-    state.set_terminal_colors(&session_id, colors).await
-}
-
-/// A host reached by a one-shot connection: no PTY, no jump hosts.
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OneShotTarget {
-    host: String,
-    port: u16,
-    username: String,
-    password: Option<String>,
-    private_key: Option<String>,
-    passphrase: Option<String>,
-    #[serde(default)]
-    legacy_algorithms: bool,
-    proxy: Option<ProxySpec>,
-    knock: Option<KnockSpec>,
-}
-
-impl OneShotTarget {
-    async fn connect(
-        self,
-        known_hosts: &Arc<KnownHostsStore>,
-    ) -> Result<client::Authenticated, String> {
-        client::connect_authenticated(
-            Arc::clone(known_hosts),
-            &self.host,
-            self.port,
-            &self.username,
-            self.password.as_deref(),
-            self.private_key.as_deref(),
-            self.passphrase.as_deref(),
-            self.legacy_algorithms,
-            &HopRoute {
-                proxy: self.proxy,
-                knock: self.knock,
-            },
-        )
-        .await
-    }
-}
-
-async fn hang_up(handle: &russh::client::Handle<client::SshClient>) {
-    let _ = handle
-        .disconnect(russh::Disconnect::ByApplication, "Done", "en")
-        .await;
-}
-
-#[tauri::command]
-pub async fn ssh_detect_distro_direct(
-    known_hosts: tauri::State<'_, Arc<KnownHostsStore>>,
-    target: OneShotTarget,
-) -> Result<String, String> {
-    let (handle, platform) = target.connect(&known_hosts).await?;
-    let machine = crate::ssh::session::Machine {
-        handle: Arc::new(handle),
-        inside: None,
-    };
-    let distro = crate::ssh::session::detect_distro(&machine, platform).await;
-    hang_up(&machine.handle).await;
-    distro
-}
-
-#[derive(serde::Serialize)]
-pub struct SshExecResult {
-    pub stdout: String,
-    pub stderr: String,
-    /// None when the channel closed without ever sending an exit status —
-    /// distinct from `Some(0)`, so a caller can't mistake "unknown" for "ok".
-    pub exit_code: Option<i32>,
-}
-
-#[tauri::command]
-pub async fn ssh_exec_command(
-    known_hosts: tauri::State<'_, Arc<KnownHostsStore>>,
-    target: OneShotTarget,
-    command: String,
-) -> Result<SshExecResult, String> {
-    use tokio::time::{timeout, Duration};
-
-    let (handle, _) = target.connect(&known_hosts).await?;
-
-    let mut channel = handle
-        .channel_open_session()
-        .await
-        .map_err(|e| format!("Channel error: {}", e))?;
-
-    channel
-        .exec(true, command.as_str())
-        .await
-        .map_err(|e| format!("Exec error: {}", e))?;
-
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let mut exit_code: Option<i32> = None;
-
-    // Read to Close rather than Eof: the exit status usually follows Eof, and
-    // breaking there is what loses it.
-    let timed_out = timeout(Duration::from_secs(30), async {
-        while let Some(msg) = channel.wait().await {
-            match msg {
-                russh::ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
-                russh::ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
-                russh::ChannelMsg::ExitStatus { exit_status } => {
-                    exit_code = Some(exit_status as i32)
-                }
-                russh::ChannelMsg::Close => break,
-                _ => {}
-            }
-        }
-    })
-    .await
-    .is_err();
-
-    hang_up(&handle).await;
-
-    // A hard 30s timeout means the remote command never finished: "exit 0,
-    // partial stdout" would misreport that as a success.
-    if timed_out {
-        return Err("Remote command timed out after 30s".to_string());
-    }
-
-    Ok(SshExecResult {
-        stdout: String::from_utf8_lossy(&stdout).to_string(),
-        stderr: String::from_utf8_lossy(&stderr).to_string(),
-        exit_code,
-    })
-}
-
-#[tauri::command]
-pub async fn ssh_kill_persistent(
-    known_hosts: tauri::State<'_, Arc<KnownHostsStore>>,
-    target: OneShotTarget,
-    session_id: String,
-) -> Result<bool, String> {
-    use crate::ssh::exec::stdout_within;
-    use tokio::time::Duration;
-
-    let (handle, _) = target.connect(&known_hosts).await?;
-
-    let command = crate::shell_integration::force_kill_command(&session_id);
-
-    let output = stdout_within(&handle, &command, Duration::from_secs(15)).await?;
-
-    hang_up(&handle).await;
-
-    Ok(output.contains("VOLTIUS_KILLED"))
 }
